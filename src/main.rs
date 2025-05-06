@@ -218,6 +218,8 @@ impl HttpServer {
                     self.write_response_line_header(stream,  &response);
                 }
             }
+        }else{
+            self.write_response_line_header(stream,  &response);
         }
     }
 
