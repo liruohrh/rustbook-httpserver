@@ -241,6 +241,7 @@ impl HttpServer {
                 stream.write(header_line.as_bytes()).unwrap();
             }
         }
+        stream.write(b"\r\n").unwrap();
     }
 }
 fn format_now()->String{
