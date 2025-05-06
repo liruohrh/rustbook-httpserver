@@ -1,19 +1,52 @@
+mod mime_type;
+
+
+use mime_type::get_content_type;
+
 use std::{
     collections::HashMap,
-    fs::{self, File},
+    fs::{File},
     io::{self, BufRead, BufReader, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    path::{self, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH, Duration},
 };
-use std::time::Duration;
+
+fn main() {
+    let mut http_server = HttpServer::new("127.0.0.1:8080".into());
+    http_server.view_root = Some("./templates".into());
+    http_server.add_middleware(Middleware::new(|chain, ctx| {
+        println!(
+            "[{}]: [{}] {:?} {}",
+            format_now(),
+            ctx.request.remote_addr, ctx.request.method, ctx.request.path
+        );
+        chain.next(ctx)
+    }));
+    http_server.add_any_method_handler("/static/**".into(), |ctx| {
+        let mut target = ctx.request.path.replace("/static", "");
+        if target.starts_with('/') {
+            target.remove(0);
+        }
+        if target.is_empty()  {
+            target = "index.html".into();
+        }
+        let path_buf = Path::new("./static/").join(target);
+        let file_path = String::from(path_buf.to_str().unwrap());
+        ctx.response = Some(HttpResponse::file(file_path));
+    });
+    http_server.add_handler(HttpMethod::GET, "/ping".into(), |ctx| {
+        ctx.set_response(HttpResponse::json(String::from( r#"{"msg": "pong"}"#)));
+    });
+    http_server.run();
+}
 
 type HttpHandler = fn(ctx: &mut Context);
 type MiddlewareFunc = fn(chain: &mut MiddlewareChain, ctx: &mut Context);
 
 #[derive(Debug)]
 struct RequestMapping {
-    method: HttpMethod,
+    method: Option<HttpMethod>,
     path: String,
     handler: HttpHandler,
 }
@@ -139,7 +172,14 @@ impl HttpServer {
     }
     fn add_handler(&mut self, method: HttpMethod, path: String, handler: HttpHandler) {
         self.handlers.push(RequestMapping {
-            method,
+            method: Some(method),
+            handler,
+            path,
+        });
+    }
+    fn add_any_method_handler(&mut self, path: String, handler: HttpHandler) {
+        self.handlers.push(RequestMapping {
+            method: None,
             handler,
             path,
         });
@@ -161,11 +201,23 @@ impl HttpServer {
             }
         }
     }
+    fn is_match(&self, request: &HttpRequest, mapping: &RequestMapping) -> bool {
+       if mapping.method.as_ref().is_some_and(|m| *m != request.method) {
+           return false;
+       }
+        if  mapping.path == request.path {
+            return true;
+        }
+        if mapping.path.ends_with("/**") && request.path.starts_with(mapping.path.replace("/**", "").as_str()) {
+            return true;
+        }
+        false
+    }
     fn dispatch_request(&self, request: HttpRequest) -> Option<HttpResponse> {
         let handler = self
             .handlers
             .iter()
-            .find(|mapping| mapping.method == request.method && mapping.path == request.path);
+            .find(|mapping| self.is_match(&request, *mapping));
         match handler {
             None => Some(HttpResponse::new(404)),
             Some(mapping) => {
@@ -218,6 +270,24 @@ impl HttpServer {
                     self.write_response_line_header(stream,  &response);
                 }
             }
+        }else if let Some(file_path) = response.file.as_ref() {
+            match File::open(file_path) {
+                Ok(ref mut file) => {
+                    if let Some(headers) = response.headers.as_mut() {
+                        headers.insert("Content-Type".into(), get_content_type(file_path).into());
+                    }
+                    self.write_response_line_header(stream,  &response);
+                    io::copy(file, stream).unwrap();
+                }
+                Err(e) => {
+                    println!("Error opening file: {} {:?}", e, file_path);
+                    response.status_code = 404;
+                    if let Some(headers) = response.headers.as_mut() {
+                        headers.remove("Content-Type");
+                    }
+                    self.write_response_line_header(stream,  &response);
+                }
+            }
         }else{
             self.write_response_line_header(stream,  &response);
         }
@@ -253,22 +323,6 @@ fn offset8() -> Option<Duration> {
     Some(Duration::from_secs(8 * 60 * 60))
 }
 
-fn main() {
-    let mut http_server = HttpServer::new("127.0.0.1:8080".into());
-    http_server.view_root = Some("./template".into());
-    http_server.add_middleware(Middleware::new(|chain, ctx| {
-        println!(
-            "[{}]: [{}] {:?} {}",
-            format_now(),
-            ctx.request.remote_addr, ctx.request.method, ctx.request.path
-        );
-        chain.next(ctx)
-    }));
-    http_server.add_handler(HttpMethod::GET, "/".into(), |ctx| {
-        ctx.set_response(HttpResponse::view("index.html".into()));
-    });
-    http_server.run();
-}
 
 #[derive(Debug)]
 struct HttpRequest {
@@ -286,8 +340,21 @@ struct HttpResponse {
     headers: Option<HashMap<String, String>>,
     body: Option<String>,
     view: Option<String>,
+    file: Option<String>,
 }
 impl HttpResponse {
+    fn file(path: String) -> HttpResponse {
+        HttpResponse {
+            status_code: 200,
+            headers: Some(HashMap::from([(
+                "Content-Type".to_string(),
+                "text/html".to_string(),
+            )])),
+            body: None,
+            view: None,
+            file: Some(path),
+        }
+    }
     fn view(view_name: String) -> HttpResponse {
         HttpResponse {
             status_code: 200,
@@ -297,6 +364,7 @@ impl HttpResponse {
             )])),
             body: None,
             view: Some(view_name.into()),
+            file: None,
         }
     }
     fn json(json: String) -> HttpResponse {
@@ -308,6 +376,7 @@ impl HttpResponse {
             )])),
             body: Some(json),
             view: None,
+            file: None,
         }
     }
     fn new(status_code: u16) -> HttpResponse {
@@ -316,6 +385,7 @@ impl HttpResponse {
             headers: None,
             body: None,
             view: None,
+            file: None,
         }
     }
     fn status_code(mut self, status_code: u16) -> Self {
