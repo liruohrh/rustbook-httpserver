@@ -1,16 +1,11 @@
 mod mime_type;
-
+mod thread_pool;
 
 use mime_type::get_content_type;
 
-use std::{
-    collections::HashMap,
-    fs::{File},
-    io::{self, BufRead, BufReader, Write},
-    net::{Shutdown, TcpListener, TcpStream},
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH, Duration},
-};
+use std::{collections::HashMap, fs::{File}, io::{self, BufRead, BufReader, Write}, net::{Shutdown, TcpListener, TcpStream}, path::{Path, PathBuf}, thread, time::{SystemTime, UNIX_EPOCH, Duration}};
+use std::sync::Arc;
+use crate::thread_pool::ThreadPool;
 
 fn main() {
     let mut http_server = HttpServer::new("127.0.0.1:8080".into());
@@ -37,6 +32,11 @@ fn main() {
     });
     http_server.add_handler(HttpMethod::GET, "/ping".into(), |ctx| {
         ctx.set_response(HttpResponse::json(String::from( r#"{"msg": "pong"}"#)));
+    });
+    http_server.add_handler(HttpMethod::GET, "/sleep".into(), |ctx| {
+        let time = ctx.request.query("time").unwrap_or("1000".into()).parse::<u64>().unwrap_or(1000);
+        thread::sleep(Duration::from_millis(time));
+        ctx.set_response(HttpResponse::json(String::from( format!("{{\"msg\": \"sleep {}ms\"}}", time))));
     });
     http_server.run();
 }
@@ -185,20 +185,28 @@ impl HttpServer {
         });
     }
 
-    fn run(&self) {
+    fn run(self) {
+        //simply use
+        let pool = ThreadPool::new(2).unwrap();
         let listener = TcpListener::bind(&self.address).unwrap();
+        let server = Arc::new(self);
         for stream in listener.incoming() {
-            let mut _stream = stream.unwrap();
-            let response = match parse_http_request(&_stream) {
-                Ok(request) => self.dispatch_request(request),
-                Err(()) => {
-                    _stream.shutdown(Shutdown::Both).unwrap();
-                    None
+            let _server = Arc::clone(&server);
+            pool.execute(move || {
+                let mut _stream = stream.unwrap();
+                let response = match parse_http_request(&_stream) {
+                    Ok(request) => _server.dispatch_request(request),
+                    Err(()) => {
+                        _stream.shutdown(Shutdown::Both).unwrap();
+                        None
+                    }
+                };
+                if let Some(resp) = response {
+                    _server.handler_response(&mut _stream, resp);
                 }
-            };
-            if let Some(resp) = response {
-                self.handler_response(&mut _stream, resp);
-            }
+            }).unwrap_or_else(|e| {
+                println!("server: {}", e);
+            });
         }
     }
     fn is_match(&self, request: &HttpRequest, mapping: &RequestMapping) -> bool {
@@ -326,12 +334,50 @@ fn offset8() -> Option<Duration> {
 
 #[derive(Debug)]
 struct HttpRequest {
+    version: String,
     remote_addr: String,
     method: HttpMethod,
     path: String,
-    version: String,
+    hash: Option<String>,
+    /// has not decode
+    query_string: Option<String>,
+    /// has not decode
+    params: Option<HashMap<String, Vec<String>>>,
     headers: HashMap<String, String>,
     body: Option<String>,
+}
+
+impl HttpRequest {
+    fn query_all(&mut self, key: String) -> Option<Vec<String>> {
+        if self.query_string.is_none() {
+            return None;
+        }
+        if self.params.is_none() {
+            let mut _params = HashMap::<String, Vec<String>>::new();
+            let query_string = self.query_string.as_ref().unwrap();
+            for pv in query_string.split('&') {
+                match pv.split_once("=") {
+                    None => {
+                        _params.insert(pv.into(), Vec::<String>::new());
+                    }
+                    Some((k, v)) => {
+                        _params.entry(k.into())
+                            .or_insert_with(Vec::new)
+                            .push(v.into());
+                    }
+                }
+            }
+            if _params.is_empty() {
+                self.params = Some(HashMap::default());
+            }else{
+                self.params = Some(_params);
+            }
+        }
+        self.params.as_ref().unwrap().get(&key).cloned()
+    }
+    fn query(&mut self, key: &str) -> Option<String> {
+        self.query_all(key.into())?.get(0).cloned()
+    }
 }
 
 #[derive(Debug)]
@@ -426,7 +472,7 @@ fn parse_http_request(stream: &TcpStream) -> Result<HttpRequest, ()> {
         return Err(());
     }
     let method = request_line[0].to_string();
-    let path = request_line[1].to_string();
+    let part_url = request_line[1].to_string();
     let version = request_line[2].to_string();
 
     // 解析请求头
@@ -451,13 +497,43 @@ fn parse_http_request(stream: &TcpStream) -> Result<HttpRequest, ()> {
     if let Err(_) = remote_addr {
         return Err(());
     }
+    let mut hash: Option<String> = None;
+    let mut query_string: Option<String> = None;
+    let mut path = part_url.clone();
+    match part_url.find("#") {
+        Some(hash_i) => {
+            let mut _hash = part_url[hash_i + 1..].to_string();
+            path = part_url[0..hash_i].to_string();
+            match _hash.find("?") {
+                None => {
+                    hash = Some(_hash);
+                }
+                Some(q_i) => {
+                    hash = Some(_hash[0..q_i].to_string());
+                    query_string = Some(_hash[q_i + 1..].to_string());
+                }
+            }
+        }
+        None => {
+            match part_url.find("?") {
+                None => {}
+                Some(q_i) => {
+                    path = part_url[0..q_i].to_string();
+                    query_string = Some(part_url[q_i + 1..].to_string());
+                }
+            }
+        }
+    }
     Ok(HttpRequest {
+        version,
         remote_addr: remote_addr.unwrap().to_string(),
         method: HttpMethod::name_of(method.to_uppercase()).unwrap(),
         path,
-        version,
+        hash,
+        query_string,
         headers,
         body,
+        params: None
     })
 }
 
