@@ -7,7 +7,7 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 #[derive(Debug)]
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    tx: mpsc::Sender<Job>,
+    tx: Option<mpsc::Sender<Job>>,
 }
 
 impl ThreadPool {
@@ -22,17 +22,33 @@ impl ThreadPool {
         for i in 0..size {
             workers.push(Worker::new(i, Arc::clone(&arx)));
         }
-        Ok(ThreadPool { workers, tx })
+        Ok(ThreadPool { workers, tx: Some(tx) })
     }
     pub fn execute<T>(&self, task: T) -> Result<(), mpsc::SendError<Job>>
     where
         T: FnOnce() + Send + 'static,
     {
         let task = Box::new(task);
-        self.tx.send(task)?;
+        self.tx.as_ref().unwrap().send(task)?;
         Ok(())
     }
 }
+
+
+impl Drop for ThreadPool {
+    /// invoke when value was freed.
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        for worker in self.workers.drain(..) {
+            println!("Shutting down worker {}", worker.id);
+            //join need JoinHandler owns, need move worker to here,
+            // or change handler type to Option, take can move owns and set worker.handler to be None
+            //   just like self.tx
+            worker.handler.join().unwrap();
+        }
+    }
+}
+
 
 #[derive(Debug)]
 pub struct Worker {
@@ -47,6 +63,7 @@ impl Worker {
                 let res = arx.lock().unwrap().recv();
                 if let Some(err) = res.as_ref().err() {
                     println!("Worker[{id}] got an error: {err}");
+                    break;
                 }else{
                     let job = res.unwrap();
                     println!("Worker[{id}] got a job; executing.");
